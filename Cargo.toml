@@ -1,0 +1,47 @@
+[package]
+name = "ce-pubsub"
+version = "0.1.0"
+edition = "2024"
+description = "Managed Pub/Sub over the CE mesh — Gossipsub topics for live fan-out plus a durable ce-coord append log for at-least-once replay. An application built ON CE primitives, not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-pubsub"
+keywords = ["ce", "pubsub", "messaging", "p2p", "gossipsub"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
+
+# ce-pubsub is both a reusable library (topic registry, the durable-log message model, the publish /
+# subscribe / pull engine, capability scoping) and the `ce-pubsub` CLI over it. The library is
+# unit-tested; the binary is a thin shell around it.
+[lib]
+name = "ce_pubsub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-pubsub"
+path = "src/main.rs"
+
+[dependencies]
+# The CE SDK: mesh pub/sub (publish/subscribe/messages), directed request/reply, blobs. The only
+# door to the local node.
+ce-rs = { path = "../ce-rs" }
+# The coordination layer: the single-writer replicated append log that makes delivery durable and
+# replayable (RVec + Snapshot), plus typed Streams for live fan-out.
+ce-coord = { path = "../ce-coord" }
+# The capability verifier primitive — publish/subscribe access tokens scoped to a topic.
+ce-cap = { path = "../ce/crates/ce-cap" }
+# Identity: minting capability links requires a signing key; loaded from the CE data dir.
+ce-identity = { path = "../ce/crates/ce-identity" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
