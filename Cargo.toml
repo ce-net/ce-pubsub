@@ -45,3 +45,12 @@ directories = "5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+proptest = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Unify the ce-rs crate instance: ce-coord depends on ce-rs via git, while this crate (and its tests'
+# ephemeral-node harness) use the local path ce-rs. Without this patch the two would be DISTINCT crate
+# instances and their `CeClient` types would not interoperate (so `Coord::with_client(node.client)`
+# would not typecheck). The path tree is the source of truth; this makes the whole graph use it.
+[patch."https://github.com/ce-net/ce-rs"]
+ce-rs = { path = "../ce-rs" }

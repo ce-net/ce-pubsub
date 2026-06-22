@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout ce-pubsub
+        uses: actions/checkout@v4
+        with:
+          path: ce-pubsub
+
+      # Path dependency: ce-pubsub depends on ../ce-rs
+      - name: Checkout ce-rs
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-rs
+          path: ce-rs
+
+      # Path dependency: ce-pubsub depends on ../ce-coord
+      - name: Checkout ce-coord
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-coord
+          path: ce-coord
+
+      # Path dependency: ce-cap + ce-identity live inside ce-net/ce (../ce/crates/*)
+      - name: Checkout ce
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce
+          path: ce
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ce-pubsub
+
+      - name: Build
+        working-directory: ce-pubsub
+        run: cargo build --all --verbose
+
+      - name: Test
+        working-directory: ce-pubsub
+        run: cargo test --all --verbose

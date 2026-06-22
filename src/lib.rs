@@ -113,6 +113,16 @@ impl PubSub {
         Ok(PubSub { coord, ce: CeClient::local(), node_id })
     }
 
+    /// Build a [`PubSub`] over an existing [`Coord`] and a matching [`CeClient`] for the same node.
+    /// Both must target the *same* CE node (the `Coord`'s pump and the request/reply path share it).
+    /// This is the injection point for tests against an ephemeral node on a non-default port, and for
+    /// apps that already hold a `Coord`. Panics-free: the only requirement is that `ce` points at the
+    /// node `coord` wraps.
+    pub fn with_coord(coord: Coord, ce: CeClient) -> PubSub {
+        let node_id = coord.node_id().to_string();
+        PubSub { coord, ce, node_id }
+    }
+
     /// This node's NodeId (hex). Subscribers on other nodes need it to follow topics this node owns.
     pub fn node_id(&self) -> &str {
         &self.node_id
