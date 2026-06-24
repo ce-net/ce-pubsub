@@ -2,11 +2,13 @@
 //! tests: malformed payloads, topic-name boundaries, message decoding robustness, capability
 //! inspection of garbage, and the durable-log cursor boundaries.
 
-use ce_pubsub::caps::{inspect_link, mint_link, verify_link, ABILITY_PUBLISH};
-use ce_pubsub::log::{LogOp, TopicLog};
-use ce_pubsub::message::{ingest_topic, live_topic, log_name, validate_topic, Message};
+use ce_cap::{Caveats, Resource, SignedCapability};
 use ce_coord::StateMachine;
 use ce_identity::{Identity, NodeId};
+use ce_pubsub::caps::{ABILITY_PUBLISH, inspect_link, mint_link, verify_link};
+use ce_pubsub::dedup::{IdempotencyCache, Seen, TokenSet};
+use ce_pubsub::log::{LogOp, TopicLog};
+use ce_pubsub::message::{Message, ingest_topic, live_topic, log_name, validate_topic};
 
 fn ident(tag: &str) -> Identity {
     let dir = std::env::temp_dir().join(format!("ce-pubsub-edge-{tag}-{}", std::process::id()));
@@ -30,7 +32,11 @@ fn message_with_corrupt_hex_payload_decodes_to_error_not_panic() {
     v["payload_hex"] = serde_json::Value::String("zz not hex".into());
     let bad: Message = serde_json::from_value(v).unwrap();
     assert!(bad.data().is_err(), "corrupt payload hex must error");
-    assert_eq!(bad.text(), "", "text() degrades to empty on bad hex, never panics");
+    assert_eq!(
+        bad.text(),
+        "",
+        "text() degrades to empty on bad hex, never panics"
+    );
 }
 
 #[test]
@@ -128,10 +134,20 @@ fn inspect_garbage_tokens_error_not_panic() {
 fn verify_garbage_token_errors() {
     let owner = ident("v");
     let r = verify_link(
-        &owner.node_id(), &[], &[], 1000, &owner.node_id(),
-        ABILITY_PUBLISH, "t", "not a token", &never,
+        &owner.node_id(),
+        &[],
+        &[],
+        1000,
+        &owner.node_id(),
+        ABILITY_PUBLISH,
+        "t",
+        "not a token",
+        &never,
     );
-    assert!(r.is_err(), "garbage token must be a clean error, not a panic");
+    assert!(
+        r.is_err(),
+        "garbage token must be a clean error, not a panic"
+    );
 }
 
 #[test]
@@ -140,9 +156,240 @@ fn empty_scope_link_covers_any_topic() {
     let owner = ident("e");
     let token = mint_link(&owner, owner.node_id(), ABILITY_PUBLISH, "", 0, 1).unwrap();
     for topic in ["a", "orders", "anything.at.all"] {
-        assert!(verify_link(
-            &owner.node_id(), &[], &[], 1000, &owner.node_id(),
-            ABILITY_PUBLISH, topic, &token, &never,
-        ).is_ok());
+        assert!(
+            verify_link(
+                &owner.node_id(),
+                &[],
+                &[],
+                1000,
+                &owner.node_id(),
+                ABILITY_PUBLISH,
+                topic,
+                &token,
+                &never,
+            )
+            .is_ok()
+        );
     }
+}
+
+// ---------- multi-hop capability attenuation ----------
+
+/// Build a 2-link delegation chain: owner -> holder (scope `parent_scope`), holder -> delegate
+/// (scope `child_scope`), both granting `pubsub:publish`. Returns the encoded chain token.
+fn delegated_chain(
+    owner: &Identity,
+    holder: &Identity,
+    delegate: NodeId,
+    parent_scope: &str,
+    child_scope: &str,
+) -> String {
+    let root = SignedCapability::issue(
+        owner,
+        holder.node_id(),
+        vec![ABILITY_PUBLISH.to_string()],
+        Resource::Node(owner.node_id()),
+        Caveats {
+            not_after: 0,
+            path_prefix: Some(parent_scope.to_string()),
+            ..Default::default()
+        },
+        1,
+        None,
+    );
+    let leaf = SignedCapability::issue(
+        holder,
+        delegate,
+        vec![ABILITY_PUBLISH.to_string()],
+        Resource::Node(owner.node_id()),
+        Caveats {
+            not_after: 0,
+            path_prefix: Some(child_scope.to_string()),
+            ..Default::default()
+        },
+        2,
+        Some(root.id()),
+    );
+    ce_cap::encode_chain(&[root, leaf])
+}
+
+#[test]
+fn multi_hop_same_scope_delegation_verifies() {
+    // A 2-link chain re-delegating the SAME topic scope must verify for the leaf audience. This is the
+    // realistic ce-pubsub case: topics use `.` separators (`orders.eu`), while ce-cap's path_prefix
+    // attenuation narrows on `/` segment boundaries — so a `.`-topic prefix is re-delegated whole, and
+    // the app-level topic-prefix scope (topic_allows) is what gates the leaf against the request.
+    let owner = ident("mh-owner");
+    let holder = ident("mh-holder");
+    let delegate = ident("mh-delegate");
+
+    let token = delegated_chain(&owner, &holder, delegate.node_id(), "orders", "orders");
+
+    // The delegate may publish within the scope and any deeper `.`-prefix the leaf scope covers.
+    assert!(
+        verify_link(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &delegate.node_id(),
+            ABILITY_PUBLISH,
+            "orders",
+            &token,
+            &never,
+        )
+        .is_ok(),
+        "delegate publishes within the re-delegated scope"
+    );
+    assert!(
+        verify_link(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &delegate.node_id(),
+            ABILITY_PUBLISH,
+            "orders.eu",
+            &token,
+            &never,
+        )
+        .is_ok(),
+        "and under the topic prefix the leaf scope covers"
+    );
+
+    // ...but NOT outside the leaf scope.
+    assert!(
+        verify_link(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &delegate.node_id(),
+            ABILITY_PUBLISH,
+            "payments",
+            &token,
+            &never,
+        )
+        .is_err(),
+        "a delegated chain cannot reach a topic outside its scope"
+    );
+}
+
+#[test]
+fn multi_hop_path_attenuation_narrows_on_slash_boundary() {
+    // ce-cap's path_prefix narrowing IS enforced on `/` segment boundaries between links. Prove it:
+    // owner grants `team/`, holder may re-delegate `team/eu` (within), but NOT `team-other` (escape).
+    let owner = ident("mhp-owner");
+    let holder = ident("mhp-holder");
+    let delegate = ident("mhp-delegate");
+
+    let within = delegated_chain(&owner, &holder, delegate.node_id(), "team", "team/eu");
+    assert!(
+        verify_link(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &delegate.node_id(),
+            ABILITY_PUBLISH,
+            "team/eu",
+            &within,
+            &never,
+        )
+        .is_ok(),
+        "re-delegating within the parent path segment verifies"
+    );
+
+    // A leaf that tries to BROADEN beyond the parent path is rejected by ce-cap attenuation.
+    let escape = delegated_chain(&owner, &holder, delegate.node_id(), "team/eu", "team");
+    assert!(
+        verify_link(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &delegate.node_id(),
+            ABILITY_PUBLISH,
+            "team",
+            &escape,
+            &never,
+        )
+        .is_err(),
+        "a leaf cannot broaden its path beyond the parent (attenuation is one-way)"
+    );
+}
+
+#[test]
+fn multi_hop_chain_rejects_wrong_audience_at_leaf() {
+    let owner = ident("mh2-owner");
+    let holder = ident("mh2-holder");
+    let delegate = ident("mh2-delegate");
+    let stranger = ident("mh2-stranger");
+    let token = delegated_chain(&owner, &holder, delegate.node_id(), "t", "t");
+    // A node that is not the leaf audience cannot wield the chain.
+    assert!(
+        verify_link(
+            &owner.node_id(),
+            &[],
+            &[],
+            1000,
+            &stranger.node_id(),
+            ABILITY_PUBLISH,
+            "t",
+            &token,
+            &never,
+        )
+        .is_err(),
+        "only the leaf audience may use a delegated chain"
+    );
+}
+
+// ---------- de-dup cache correctness across the capacity-reset boundary ----------
+
+#[test]
+fn idempotency_cache_dedups_recent_after_eviction_pressure() {
+    // The exact failure the bounded cache replaces (old code cleared wholesale at capacity): a recent
+    // key must stay deduped while the cache is under insertion pressure, and only the OLDEST is ever
+    // evicted — never a wholesale forget of every key.
+    let mut c = IdempotencyCache::new(4, 3600);
+    c.insert("req-recent".into(), Seen::Cursor(42), 100);
+    // Push three more distinct keys (cache holds 4). The recent key is still present and deduped.
+    for i in 0..3 {
+        c.insert(format!("filler-{i}"), Seen::Cursor(i), 100 + i);
+    }
+    assert_eq!(
+        c.get("req-recent", 110),
+        Some(Seen::Cursor(42)),
+        "recent key survives at capacity"
+    );
+    // One more insert evicts the OLDEST (req-recent), not the whole set: the just-inserted fillers stay.
+    c.insert("filler-3".into(), Seen::Cursor(9), 105);
+    assert!(
+        c.get("req-recent", 110).is_none(),
+        "only the oldest key is evicted"
+    );
+    assert_eq!(
+        c.get("filler-2", 110),
+        Some(Seen::Cursor(2)),
+        "newer keys are NOT forgotten"
+    );
+    assert_eq!(c.get("filler-3", 110), Some(Seen::Cursor(9)));
+}
+
+#[test]
+fn token_set_dedups_across_capacity_and_ttl() {
+    let mut s = TokenSet::new(3, 100);
+    assert!(!s.seen(1, 0));
+    assert!(s.seen(1, 50), "within ttl, a repeat is recognized");
+    // Fill to capacity with new tokens; the oldest (1) is evicted, the rest retained.
+    assert!(!s.seen(2, 60));
+    assert!(!s.seen(3, 61));
+    assert!(!s.seen(4, 62)); // evicts token 1
+    assert!(
+        !s.seen(1, 63),
+        "evicted token treated as new (oldest-only eviction)"
+    );
+    assert!(s.seen(4, 64), "recent token still deduped");
+    // TTL expiry: a token older than the ttl is new again.
+    assert!(!s.seen(4, 64 + 101), "expired token is new again");
 }

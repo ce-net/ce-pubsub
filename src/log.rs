@@ -11,7 +11,7 @@
 //! The state machine is deliberately tiny: it only appends. Truncation/retention is a separate,
 //! explicit op so retention policy stays the owner's decision, never an accident of replication.
 
-use ce_coord::{json_snapshot, Snapshot, StateMachine};
+use ce_coord::{Snapshot, StateMachine, json_snapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Cursor, Message};
@@ -42,7 +42,16 @@ impl StateMachine for TopicLog {
     type Op = LogOp;
     fn apply(&mut self, op: LogOp) {
         match op {
-            LogOp::Append(m) => self.messages.push(m),
+            LogOp::Append(mut m) => {
+                // Enforce the contiguity invariant the rest of the algebra depends on: every retained
+                // message occupies `floor + index + 1`, so a message's absolute cursor MUST be exactly
+                // `next_cursor()`. The single-writer stamps this correctly, but a replica applying a
+                // malformed op (or a future bug) must not silently desync `floor`/`since`/`get`. We
+                // re-stamp the canonical cursor rather than trust the op, keeping cursors absolute and
+                // strictly increasing no matter what was proposed.
+                m.cursor = self.next_cursor();
+                self.messages.push(m);
+            }
             LogOp::PruneTo(up_to) => {
                 let before = self.messages.len();
                 self.messages.retain(|m| m.cursor > up_to);
@@ -89,12 +98,27 @@ impl TopicLog {
     /// Every retained message with `cursor > from`, in order — the replay slice a puller wants when
     /// it asks for "everything after `from`". `from = 0` returns all retained messages.
     pub fn since(&self, from: Cursor) -> Vec<Message> {
-        self.messages.iter().filter(|m| m.cursor > from).cloned().collect()
+        self.messages
+            .iter()
+            .filter(|m| m.cursor > from)
+            .cloned()
+            .collect()
     }
 
     /// All retained messages, in cursor order.
     pub fn all(&self) -> Vec<Message> {
         self.messages.clone()
+    }
+
+    /// The retained message at absolute `cursor`, or `None` if it was pruned or never existed. Because
+    /// retained messages are contiguous with absolute cursors `floor+1 ..= high`, this is an O(1)
+    /// indexed lookup rather than a scan.
+    pub fn get(&self, cursor: Cursor) -> Option<Message> {
+        if cursor <= self.floor || cursor > self.high_cursor() {
+            return None;
+        }
+        let idx = (cursor - self.floor - 1) as usize;
+        self.messages.get(idx).cloned()
     }
 }
 
@@ -161,6 +185,45 @@ mod tests {
         assert_eq!(log.next_cursor(), 6);
         // since() respects the floor: asking before the floor returns only surviving messages.
         assert_eq!(log.since(0).len(), 3);
+    }
+
+    #[test]
+    fn get_indexes_by_absolute_cursor_after_prune() {
+        let mut log = TopicLog::default();
+        for i in 1..=5 {
+            log.apply(LogOp::Append(msg(i, &format!("m{i}"))));
+        }
+        // Before prune: exact cursor lookup.
+        assert_eq!(log.get(1).unwrap().text(), "m1");
+        assert_eq!(log.get(5).unwrap().text(), "m5");
+        assert!(log.get(0).is_none());
+        assert!(log.get(6).is_none());
+        // After pruning 1,2: pruned cursors return None, survivors keep absolute lookup.
+        log.apply(LogOp::PruneTo(2));
+        assert!(log.get(1).is_none(), "pruned cursor is gone");
+        assert!(log.get(2).is_none());
+        assert_eq!(log.get(3).unwrap().text(), "m3");
+        assert_eq!(log.get(5).unwrap().text(), "m5");
+        assert!(log.get(6).is_none());
+    }
+
+    #[test]
+    fn append_restamps_cursor_to_preserve_invariant() {
+        // A malformed Append carrying a wrong absolute cursor must not desync the log: the state
+        // machine re-stamps the canonical next cursor, keeping `floor`/`since`/`get` consistent.
+        let mut log = TopicLog::default();
+        log.apply(LogOp::Append(msg(999, "out-of-band cursor")));
+        assert_eq!(
+            log.high_cursor(),
+            1,
+            "cursor was re-stamped to 1, not trusted as 999"
+        );
+        assert_eq!(log.all()[0].cursor, 1);
+        log.apply(LogOp::Append(msg(0, "another")));
+        assert_eq!(log.all()[1].cursor, 2);
+        // get() by the canonical cursor works; the bogus value never indexes anything.
+        assert!(log.get(999).is_none());
+        assert_eq!(log.get(1).unwrap().text(), "out-of-band cursor");
     }
 
     #[test]

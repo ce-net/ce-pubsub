@@ -6,11 +6,11 @@
 //! These complement the hand-picked unit tests in `src/` by searching the input space: random op
 //! sequences, random binary payloads, random topic strings, and random capability scopes.
 
-use ce_pubsub::caps::{mint_link, topic_allows, verify_link, ABILITY_PUBLISH, ABILITY_SUBSCRIBE};
-use ce_pubsub::log::{LogOp, TopicLog};
-use ce_pubsub::message::{validate_topic, Message};
 use ce_coord::{Snapshot, StateMachine};
 use ce_identity::{Identity, NodeId};
+use ce_pubsub::caps::{ABILITY_PUBLISH, ABILITY_SUBSCRIBE, mint_link, topic_allows, verify_link};
+use ce_pubsub::log::{LogOp, TopicLog};
+use ce_pubsub::message::{Message, validate_topic};
 use proptest::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -104,7 +104,7 @@ proptest! {
         for _ in 0..appends {
             high += 1;
             ops.push(LogOp::Append(msg(high, format!("m{high}").as_bytes())));
-            if high % prune_every == 0 && high > 2 {
+            if high.is_multiple_of(prune_every) && high > 2 {
                 ops.push(LogOp::PruneTo(high - 2));
             }
         }

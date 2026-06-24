@@ -19,8 +19,8 @@ mod harness;
 use std::time::Duration;
 
 use ce_coord::Coord;
-use ce_pubsub::{caps, PubSub};
-use harness::{live_available, Node};
+use ce_pubsub::{PubSub, caps};
+use harness::{Node, live_available};
 
 /// Bring up a 2-node loopback mesh and a `PubSub` handle on each node.
 async fn two_node_pubsub() -> anyhow::Result<Option<(Node, Node, PubSub, PubSub)>> {
@@ -43,7 +43,9 @@ async fn two_node_pubsub() -> anyhow::Result<Option<(Node, Node, PubSub, PubSub)
 /// publish across the window so a single dropped gossip frame doesn't flake the test.
 #[tokio::test]
 async fn live_fanout_owner_to_subscriber() -> anyhow::Result<()> {
-    let Some((a, _b, ps_a, ps_b)) = two_node_pubsub().await? else { return Ok(()) };
+    let Some((a, _b, ps_a, ps_b)) = two_node_pubsub().await? else {
+        return Ok(());
+    };
 
     let topic = ps_a.create_topic("orders").await?;
     let mut sub = ps_b.subscribe("orders", &a.node_id).await?;
@@ -52,7 +54,10 @@ async fn live_fanout_owner_to_subscriber() -> anyhow::Result<()> {
 
     // Publish repeatedly until B receives one (or the window elapses).
     let recv = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(20), sub.recv()).await.ok().flatten()
+        tokio::time::timeout(Duration::from_secs(20), sub.recv())
+            .await
+            .ok()
+            .flatten()
     });
     for i in 0..20 {
         topic.publish(format!("order-{i}").as_bytes()).await?;
@@ -63,7 +68,11 @@ async fn live_fanout_owner_to_subscriber() -> anyhow::Result<()> {
     }
     match recv.await? {
         Some(msg) => {
-            assert!(msg.text().starts_with("order-"), "received a published message: {}", msg.text());
+            assert!(
+                msg.text().starts_with("order-"),
+                "received a published message: {}",
+                msg.text()
+            );
             assert_eq!(msg.publisher, a.node_id, "publisher is the owner");
         }
         None => {
@@ -79,7 +88,9 @@ async fn live_fanout_owner_to_subscriber() -> anyhow::Result<()> {
 /// strict tail. This is the at-least-once guarantee, independent of live gossip.
 #[tokio::test]
 async fn live_durable_replay_from_cursor() -> anyhow::Result<()> {
-    let Some((a, _b, ps_a, ps_b)) = two_node_pubsub().await? else { return Ok(()) };
+    let Some((a, _b, ps_a, ps_b)) = two_node_pubsub().await? else {
+        return Ok(());
+    };
 
     let topic = ps_a.create_topic("audit").await?;
     // Publish 6 messages as the owner (durably appended, each gets a monotonic cursor).
@@ -87,7 +98,11 @@ async fn live_durable_replay_from_cursor() -> anyhow::Result<()> {
     for i in 0..6 {
         cursors.push(topic.publish(format!("evt-{i}").as_bytes()).await?);
     }
-    assert_eq!(cursors, vec![1, 2, 3, 4, 5, 6], "cursors are 1-based and monotonic");
+    assert_eq!(
+        cursors,
+        vec![1, 2, 3, 4, 5, 6],
+        "cursors are 1-based and monotonic"
+    );
 
     // A fresh puller on B replays everything from the beginning, retrying until its read replica of
     // the owner's durable log converges to all 6 messages.
@@ -100,7 +115,11 @@ async fn live_durable_replay_from_cursor() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    assert_eq!(got_all.len(), 6, "puller replayed all 6 durable messages from cursor 0");
+    assert_eq!(
+        got_all.len(),
+        6,
+        "puller replayed all 6 durable messages from cursor 0"
+    );
     assert_eq!(got_all[0].cursor, 1);
     assert_eq!(got_all[5].text(), "evt-5");
 
@@ -118,7 +137,9 @@ async fn live_durable_replay_from_cursor() -> anyhow::Result<()> {
 /// directed ingest request/reply path over the mesh.
 #[tokio::test]
 async fn live_capability_publish_gating() -> anyhow::Result<()> {
-    let Some((a, b, ps_a, ps_b)) = two_node_pubsub().await? else { return Ok(()) };
+    let Some((a, b, ps_a, ps_b)) = two_node_pubsub().await? else {
+        return Ok(());
+    };
 
     let topic = ps_a.create_topic("secure").await?;
     topic.require_publish_cap(true);
@@ -129,7 +150,10 @@ async fn live_capability_publish_gating() -> anyhow::Result<()> {
     let no_token = ps_b
         .publish_to("secure", &a.node_id, b"x", None, 8_000)
         .await;
-    assert!(no_token.is_err(), "cap-gated topic must reject a tokenless remote publish");
+    assert!(
+        no_token.is_err(),
+        "cap-gated topic must reject a tokenless remote publish"
+    );
 
     // Mint a valid publish link from the OWNER (node A's identity) bound to B as the audience.
     let owner_id = ce_identity::Identity::load_or_generate(&a.data_dir_path.join("identity"))?;
@@ -140,7 +164,15 @@ async fn live_capability_publish_gating() -> anyhow::Result<()> {
     let good = caps::mint_link(&owner_id, b_node, caps::ABILITY_PUBLISH, "secure", 0, 1).unwrap();
 
     // A wrong-scope token (scoped to a different topic) → owner rejects.
-    let wrong = caps::mint_link(&owner_id, b_node, caps::ABILITY_PUBLISH, "other-topic", 0, 2).unwrap();
+    let wrong = caps::mint_link(
+        &owner_id,
+        b_node,
+        caps::ABILITY_PUBLISH,
+        "other-topic",
+        0,
+        2,
+    )
+    .unwrap();
     let wrong_res = ps_b
         .publish_to("secure", &a.node_id, b"x", Some(&wrong), 8_000)
         .await;
@@ -149,7 +181,10 @@ async fn live_capability_publish_gating() -> anyhow::Result<()> {
     // The valid token is accepted; the publish returns a cursor.
     let mut accepted = None;
     for _ in 0..6 {
-        match ps_b.publish_to("secure", &a.node_id, b"hello", Some(&good), 8_000).await {
+        match ps_b
+            .publish_to("secure", &a.node_id, b"hello", Some(&good), 8_000)
+            .await
+        {
             Ok(cursor) => {
                 accepted = Some(cursor);
                 break;
@@ -157,7 +192,10 @@ async fn live_capability_publish_gating() -> anyhow::Result<()> {
             Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
-    assert!(accepted.is_some(), "a valid pubsub:publish link must be accepted by the owner");
+    assert!(
+        accepted.is_some(),
+        "a valid pubsub:publish link must be accepted by the owner"
+    );
     assert!(accepted.unwrap() >= 1, "accepted publish got a real cursor");
 
     Ok(())

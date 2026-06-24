@@ -14,9 +14,22 @@
 //! - `pubsub:publish`   — append messages to the topic.
 //! - `pubsub:subscribe` — read / pull / replay messages from the topic.
 //!
-//! The topic scope lives in the `path_prefix` caveat as the topic name. A holder may attenuate to a
-//! topic *prefix* (e.g. mint `orders` then re-delegate `orders.eu`), which the enforcer honors via
-//! [`topic_allows`] — the requested topic must start with the scoped prefix.
+//! The topic scope lives in the `path_prefix` caveat as the topic name. The *leaf* scope is matched
+//! against the requested topic by [`topic_allows`] (a raw string prefix: the requested topic must
+//! start with the scoped prefix). So a single self-issued link scoped to `orders` covers `orders`,
+//! `orders.eu`, `orders.eu.west`, etc.
+//!
+//! ## A note on multi-hop attenuation and topic separators
+//!
+//! When a holder **re-delegates** (a 2+ link chain), `ce-cap` enforces that each child link's
+//! `path_prefix` is *narrower-or-equal* to its parent's — but it narrows on **`/` path segments**,
+//! not on the `.` separators ce-pubsub topic names use. Concretely: a parent scoped to `orders` may
+//! re-delegate `orders` (equal) but `ce-cap` does **not** consider `orders.eu` to be "within"
+//! `orders` (no `/` boundary). Re-delegation of a `.`-topic therefore passes the *same* scope down
+//! the chain, and the leaf `topic_allows` prefix check is what confines the requested topic. To get
+//! true sub-scope attenuation between links, use a `/`-segmented scope (e.g. `team` → `team/eu`),
+//! which `ce-cap` narrows correctly. This is by design (it reuses CE's one capability primitive) and
+//! is covered by the multi-hop tests in `tests/edge_cases.rs`.
 
 use anyhow::{Context, Result};
 use ce_cap::{Caveats, Resource, SignedCapability};
@@ -114,7 +127,9 @@ pub fn verify_link(
         .clone()
         .ok_or_else(|| "link has no topic scope".to_string())?;
     if !topic_allows(&scope, topic) {
-        return Err(format!("link scope '{scope}' does not cover topic '{topic}'"));
+        return Err(format!(
+            "link scope '{scope}' does not cover topic '{topic}'"
+        ));
     }
     Ok(())
 }
@@ -125,7 +140,8 @@ mod tests {
     use ce_identity::Identity;
 
     fn ident(seed: &str) -> Identity {
-        let dir = std::env::temp_dir().join(format!("ce-pubsub-cap-{}-{}", seed, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ce-pubsub-cap-{}-{}", seed, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let id = Identity::load_or_generate(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
