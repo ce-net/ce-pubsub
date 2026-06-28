@@ -2,7 +2,7 @@
 //! tests: malformed payloads, topic-name boundaries, message decoding robustness, capability
 //! inspection of garbage, and the durable-log cursor boundaries.
 
-use ce_cap::{Caveats, Resource, SignedCapability};
+use ce_iam_core::{Caveats, Resource, SignedCapability};
 use ce_coord::StateMachine;
 use ce_identity::{Identity, NodeId};
 use ce_pubsub::caps::{ABILITY_PUBLISH, inspect_link, mint_link, verify_link};
@@ -210,7 +210,7 @@ fn delegated_chain(
         2,
         Some(root.id()),
     );
-    ce_cap::encode_chain(&[root, leaf])
+    ce_iam_core::encode_chain(&[root, leaf])
 }
 
 #[test]
